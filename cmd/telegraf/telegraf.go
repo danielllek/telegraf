@@ -6,19 +6,27 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path"
+	"path/filepath"
+	"plugin"
 	"runtime"
 	"strings"
 	"syscall"
 
+	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/agent"
 	"github.com/influxdata/telegraf/internal/config"
 	"github.com/influxdata/telegraf/logger"
-	_ "github.com/influxdata/telegraf/plugins/aggregators/all"
+	"github.com/influxdata/telegraf/plugins/aggregators"
 	"github.com/influxdata/telegraf/plugins/inputs"
-	_ "github.com/influxdata/telegraf/plugins/inputs/all"
 	"github.com/influxdata/telegraf/plugins/outputs"
+	"github.com/influxdata/telegraf/plugins/processors"
+
+	_ "github.com/influxdata/telegraf/plugins/aggregators/all"
+	_ "github.com/influxdata/telegraf/plugins/inputs/all"
 	_ "github.com/influxdata/telegraf/plugins/outputs/all"
 	_ "github.com/influxdata/telegraf/plugins/processors/all"
+
 	"github.com/kardianos/service"
 )
 
@@ -50,6 +58,8 @@ var fUsage = flag.String("usage", "",
 	"print usage for a plugin, ie, 'telegraf -usage mysql'")
 var fService = flag.String("service", "",
 	"operate on the service")
+var fPlugins = flag.String("plugins", "",
+	"path to directory containing external plugins")
 
 // Telegraf version, populated linker.
 //   ie, -ldflags "-X main.version=`git describe --always --tags`"
@@ -246,10 +256,89 @@ func (p *program) Stop(s service.Service) error {
 	return nil
 }
 
+// loadExternalPlugins loads external plugins from shared libraries (.so, .dll, etc.)
+// in the specified directory.
+func loadExternalPlugins(rootDir string) error {
+	return filepath.Walk(rootDir, func(pth string, info os.FileInfo, err error) error {
+		// Stop if there was an error.
+		if err != nil {
+			return err
+		}
+
+		// Ignore directories.
+		if info.IsDir() {
+			return nil
+		}
+
+		// Ignore files that aren't shared libraries.
+		ext := strings.ToLower(path.Ext(pth))
+		if ext != ".so" && ext != ".dll" {
+			return nil
+		}
+
+		// name will be the path to the plugin file beginning at the root
+		// directory, minus the extension.
+		// ie, if the plugin file is /opt/telegraf-plugins/group1/foo.so, name
+		//     will be "group1/foo"
+		name := strings.TrimPrefix(strings.TrimPrefix(pth, rootDir), string(os.PathSeparator))
+		name = strings.TrimSuffix(name, filepath.Ext(pth))
+		name = "external" + string(os.PathSeparator) + name
+
+		// Load plugin.
+		p, err := plugin.Open(pth)
+		if err != nil {
+			return fmt.Errorf("error loading [%s]: %s", pth, err)
+		}
+
+		s, err := p.Lookup("Plugin")
+		if err != nil {
+			log.Printf("E! Could not find 'Plugin' symbol in [%s]", pth)
+			return nil
+		}
+
+		switch tplugin := s.(type) {
+		// TODO are special cases for Service plugins necessary?
+		// case *telegraf.ServiceInput:
+		// 	log.Printf("I! Adding external [[inputs.%s]]", name)
+		// 	inputs.Add(name, func() telegraf.Input { return *tplugin })
+		case *telegraf.Input:
+			log.Printf("I! Adding external [[inputs.%s]]", name)
+			inputs.Add(name, func() telegraf.Input { return *tplugin })
+		// case *telegraf.ServiceOutput:
+		// 	log.Printf("I! Adding external [[outputs.%s]]", name)
+		// 	outputs.Add(name, func() telegraf.Output { return *tplugin })
+		case *telegraf.Output:
+			log.Printf("I! Adding external [[outputs.%s]]", name)
+			outputs.Add(name, func() telegraf.Output { return *tplugin })
+		case *telegraf.Processor:
+			log.Printf("I! Adding external [[processors.%s]]", name)
+			processors.Add(name, func() telegraf.Processor { return *tplugin })
+		case *telegraf.Aggregator:
+			log.Printf("I! Adding external [[aggregators.%s]]", name)
+			aggregators.Add(name, func() telegraf.Aggregator { return *tplugin })
+		default:
+			log.Printf("E! 'Plugin' symbol from [%s] is not a telegraf interface, it has type: %T", pth, tplugin)
+		}
+
+		return nil
+	})
+}
+
 func main() {
 	flag.Usage = func() { usageExit(0) }
 	flag.Parse()
 	args := flag.Args()
+	// Load external plugins, if requested.
+	if *fPlugins != "" {
+		pluginsDir, err := filepath.Abs(*fPlugins)
+		if err != nil {
+			log.Fatal("E! " + err.Error())
+		}
+		log.Printf("I! Loading external plugins from: %s\n", pluginsDir)
+		if err := loadExternalPlugins(*fPlugins); err != nil {
+			log.Fatal("E! " + err.Error())
+		}
+	}
 
 	inputFilters, outputFilters := []string{}, []string{}
 	if *fInputFilters != "" {
